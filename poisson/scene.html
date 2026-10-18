@@ -1,0 +1,956 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<!--
+  「人生如泊松分布」逐帧画面。
+  由 render.cjs 在无头 Chromium 中打开，逐帧调用 window.render(t) 后截图。
+  window.DURATION / window.CUES / window.SCENE_STARTS 供配乐对齐使用。
+-->
+<style>
+  @font-face { font-family: "Noto Serif SC"; font-weight: 700; src: url(fonts/NotoSerifSC-700.ttf); }
+  @font-face { font-family: "Noto Serif SC"; font-weight: 900; src: url(fonts/NotoSerifSC-900.ttf); }
+  @font-face { font-family: "Noto Sans SC"; font-weight: 400; src: url(fonts/NotoSansSC-400.ttf); }
+  @font-face { font-family: "JetBrains Mono"; font-weight: 400; src: url(fonts/JetBrainsMono-400.ttf); }
+  @font-face { font-family: "JetBrains Mono"; font-weight: 500; src: url(fonts/JetBrainsMono-500.ttf); }
+  html, body { margin: 0; background: #000; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1920" height="1080"></canvas>
+<script>
+const W = 1920, H = 1080;
+const ctx = document.getElementById('c').getContext('2d');
+
+const COL = {
+  white: '#f4efe6', grey: '#9298a2', dim: '#5f6570',
+  gold: '#f4ad3d', goldCore: 'rgba(255,226,160,0.95)',
+  axis: 'rgba(255,255,255,0.22)', grid: 'rgba(255,255,255,0.055)',
+  ink: 'rgba(226,230,238,1)',
+};
+const FONT = {
+  serif: '"Noto Serif SC", serif',
+  sans: '"Noto Sans SC", sans-serif',
+  mono: '"JetBrains Mono", "Noto Sans SC", monospace',
+};
+
+// ---------- 数学工具 ----------
+
+const clamp = (x, a = 0, b = 1) => Math.max(a, Math.min(b, x));
+const lerp = (a, b, t) => a + (b - a) * t;
+const smooth = x => { x = clamp(x); return x * x * (3 - 2 * x); };
+const easeOut = x => 1 - Math.pow(1 - clamp(x), 3);
+const easeInOut = x => { x = clamp(x); return x < 0.5 ? 4 * x * x * x : 1 - Math.pow(-2 * x + 2, 3) / 2; };
+
+function rng(seed) {
+  return function () {
+    seed |= 0; seed = seed + 0x6D2B79F5 | 0;
+    let t = Math.imul(seed ^ seed >>> 15, 1 | seed);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+
+// 在 [0, T] 内按速率 rate 生成泊松事件的发生时刻
+function poissonTimes(rate, T, r) {
+  const out = [];
+  for (let t = 0; ;) {
+    t += -Math.log(1 - r()) / rate;
+    if (t > T) return out;
+    out.push(t);
+  }
+}
+
+function poissonSample(lam, r) {
+  const L = Math.exp(-lam);
+  let k = 0, p = 1;
+  do { k++; p *= r(); } while (p > L);
+  return k - 1;
+}
+
+function pmf(k, lam) {
+  let f = 1;
+  for (let i = 2; i <= k; i++) f *= i;
+  return Math.pow(lam, k) * Math.exp(-lam) / f;
+}
+
+// f 单调递增时，求 f(t) 首次达到 target 的时刻
+function whenReaches(f, target, a, b) {
+  let lo = a, hi = b;
+  for (let i = 0; i < 40; i++) {
+    const m = (lo + hi) / 2;
+    if (f(m) >= target) hi = m; else lo = m;
+  }
+  return hi;
+}
+
+// 在 [t0, t1] 内淡入淡出的透明度
+function vis(t, t0, t1, fin = 0.6, fout = 0.5) {
+  if (t < t0 || t > t1) return 0;
+  return smooth((t - t0) / fin) * (fout > 0 ? smooth((t1 - t) / fout) : 1);
+}
+
+// ---------- 绘图工具 ----------
+
+let MA = 1;  // 当前场景的整体透明度，所有绘图都会乘上它
+
+function setFont(o) {
+  ctx.font = `${o.weight} ${o.size}px ${FONT[o.font]}`;
+  ctx.letterSpacing = `${o.ls}px`;
+}
+
+// "普通{金色}普通" -> [{s, gold}]
+function runs(str) {
+  return str.split(/(\{[^}]*\})/).filter(Boolean)
+    .map(s => s[0] === '{' ? { s: s.slice(1, -1), gold: true } : { s, gold: false });
+}
+
+function lineWidthOf(str, o) {
+  setFont(o);
+  return runs(str).reduce((w, r) => w + ctx.measureText(r.s).width, 0);
+}
+
+const TEXT_DEFAULTS = {
+  size: 52, font: 'serif', weight: 700, color: COL.white, align: 'center',
+  alpha: 1, glow: 0.3, ls: 0, maxW: 1640, lh: 1.42,
+};
+
+function text(str, x, y, opts = {}) {
+  const o = Object.assign({}, TEXT_DEFAULTS, opts);
+  const a = clamp(o.alpha * MA);
+  if (a <= 0.002) return;
+  const lines = str.split('\n');
+  lines.forEach((ln, i) => drawTextLine(ln, x, y + (i - (lines.length - 1) / 2) * o.size * o.lh, o, a));
+}
+
+function drawTextLine(str, x, y, o, a) {
+  let w = lineWidthOf(str, o);
+  if (w > o.maxW) {
+    o = Object.assign({}, o, { size: o.size * o.maxW / w });
+    w = lineWidthOf(str, o);
+  }
+  let cx = o.align === 'center' ? x - w / 2 : o.align === 'right' ? x - w : x;
+  ctx.save();
+  ctx.globalAlpha = a;
+  ctx.textBaseline = 'middle';
+  ctx.textAlign = 'left';
+  for (const r of runs(str)) {
+    const col = r.gold ? COL.gold : o.color;
+    ctx.fillStyle = col;
+    if (o.glow > 0) {
+      ctx.shadowColor = r.gold ? `rgba(255,145,30,${Math.min(1, o.glow * 2.4)})` : `rgba(255,236,212,${o.glow})`;
+      ctx.shadowBlur = o.size * (r.gold ? 0.6 : 0.42);
+      ctx.fillText(r.s, cx, y);
+      if (r.gold) ctx.fillText(r.s, cx, y);
+      ctx.shadowBlur = 0;
+      ctx.shadowColor = 'transparent';
+    }
+    ctx.fillText(r.s, cx, y);
+    cx += ctx.measureText(r.s).width;
+  }
+  ctx.restore();
+}
+
+// 带淡入、上浮的文字
+function caption(lt, t0, t1, str, o = {}) {
+  const a = vis(lt, t0, t1, o.fin ?? 0.7, o.fout ?? 0.5);
+  if (a <= 0) return;
+  const rise = (1 - easeOut((lt - t0) / 0.9)) * (o.rise ?? 16);
+  text(str, o.x ?? W / 2, (o.y ?? 180) + rise, Object.assign({}, o, { alpha: a * (o.alpha ?? 1) }));
+}
+
+// 小号等宽注释
+function label(str, x, y, o = {}) {
+  text(str, x, y, Object.assign({ size: 16, font: 'mono', weight: 400, color: COL.dim, glow: 0, ls: 2 }, o));
+}
+
+function sansLabel(str, x, y, o = {}) {
+  text(str, x, y, Object.assign({ size: 20, font: 'sans', weight: 400, color: COL.grey, glow: 0, ls: 1 }, o));
+}
+
+function line(x1, y1, x2, y2, o = {}) {
+  const a = clamp((o.alpha ?? 1) * MA);
+  if (a <= 0.002) return;
+  ctx.save();
+  ctx.globalAlpha = a;
+  ctx.strokeStyle = o.color || COL.axis;
+  ctx.lineWidth = o.w || 1.5;
+  ctx.lineCap = 'round';
+  if (o.glow) { ctx.shadowColor = o.glowColor || 'rgba(255,150,40,0.9)'; ctx.shadowBlur = o.glow; }
+  ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+  ctx.restore();
+}
+
+function rect(x, y, w, h, color, alpha = 1) {
+  const a = clamp(alpha * MA);
+  if (a <= 0.002 || h <= 0 || w <= 0) return;
+  ctx.save();
+  ctx.globalAlpha = a;
+  ctx.fillStyle = color;
+  ctx.fillRect(x, y, w, h);
+  ctx.restore();
+}
+
+function glowDot(x, y, r, alpha = 1, rgb = '255,186,84') {
+  const a = clamp(alpha * MA);
+  if (a <= 0.002) return;
+  ctx.save();
+  const g = ctx.createRadialGradient(x, y, 0, x, y, r * 7);
+  g.addColorStop(0, `rgba(${rgb},${0.6 * a})`);
+  g.addColorStop(0.25, `rgba(${rgb},${0.2 * a})`);
+  g.addColorStop(1, `rgba(${rgb},0)`);
+  ctx.fillStyle = g;
+  ctx.beginPath(); ctx.arc(x, y, r * 7, 0, Math.PI * 2); ctx.fill();
+  ctx.globalAlpha = a;
+  ctx.fillStyle = 'rgb(255,244,222)';
+  ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill();
+  ctx.restore();
+}
+
+function strokePath(pts, color, w, alpha = 1) {
+  const a = clamp(alpha * MA);
+  if (pts.length < 2 || a <= 0.002) return;
+  ctx.save();
+  ctx.globalAlpha = a;
+  ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+  ctx.strokeStyle = color; ctx.lineWidth = w;
+  ctx.beginPath();
+  pts.forEach(([x, y], i) => i ? ctx.lineTo(x, y) : ctx.moveTo(x, y));
+  ctx.stroke();
+  ctx.restore();
+}
+
+// 发光的金色曲线：外层光晕 + 亮芯
+function goldPath(pts, alpha = 1, w = 3) {
+  const a = clamp(alpha * MA);
+  if (pts.length < 2 || a <= 0.002) return;
+  ctx.save();
+  ctx.globalAlpha = a;
+  ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+  ctx.beginPath();
+  pts.forEach(([x, y], i) => i ? ctx.lineTo(x, y) : ctx.moveTo(x, y));
+  ctx.strokeStyle = COL.gold; ctx.lineWidth = w;
+  ctx.shadowColor = 'rgba(255,145,30,0.95)'; ctx.shadowBlur = 20;
+  ctx.stroke();
+  ctx.shadowBlur = 0;
+  ctx.strokeStyle = COL.goldCore; ctx.lineWidth = w * 0.42;
+  ctx.stroke();
+  ctx.restore();
+}
+
+// 坐标轴：网格线 + 刻度
+function axes(o, alpha) {
+  const { x0, x1, y0, y1 } = o;
+  for (const [v, lab] of o.yTicks || []) {
+    const y = lerp(y0, y1, v);
+    line(x0, y, x1, y, { color: COL.grid, w: 1, alpha });
+    if (lab) label(lab, x0 - 18, y, { align: 'right', alpha });
+  }
+  for (const [v, lab] of o.xTicks || []) {
+    const x = lerp(x0, x1, v);
+    line(x, y0, x, y0 + 7, { color: COL.axis, w: 1.2, alpha });
+    label(lab, x, y0 + 30, { alpha });
+  }
+  line(x0, y0, x1, y0, { color: COL.axis, w: 1.5, alpha });
+  line(x0, y0, x0, y1 - 10, { color: COL.axis, w: 1.5, alpha });
+  if (o.yLabel) sansLabel(o.yLabel, x0 - 4, y1 - 42, { align: 'left', alpha });
+  if (o.xLabel) sansLabel(o.xLabel, x1, y0 + 72, { align: 'right', alpha });
+}
+
+// 右上角的模拟计数器
+function counter(title, value, x, y, alpha) {
+  label(title, x, y, { align: 'right', size: 14, ls: 6, color: COL.dim, alpha });
+  text(value, x, y + 50, { align: 'right', size: 46, font: 'mono', weight: 500, color: COL.white, glow: 0.18, alpha });
+}
+
+// ---------- 背景 ----------
+
+const bg = document.createElement('canvas');
+bg.width = W; bg.height = H;
+(function () {
+  const b = bg.getContext('2d');
+  const g = b.createRadialGradient(W * 0.5, H * 0.46, 0, W * 0.5, H * 0.46, W * 0.64);
+  g.addColorStop(0, '#151b27');
+  g.addColorStop(0.5, '#0e121a');
+  g.addColorStop(1, '#05060a');
+  b.fillStyle = g;
+  b.fillRect(0, 0, W, H);
+  // 极轻的静态颗粒，避免暗部渐变出现色带
+  const img = b.getImageData(0, 0, W, H), d = img.data, r = rng(99);
+  for (let i = 0; i < d.length; i += 4) {
+    const n = (r() - 0.5) * 5;
+    d[i] += n; d[i + 1] += n; d[i + 2] += n;
+  }
+  b.putImageData(img, 0, 0);
+})();
+
+// ---------- 时间线 ----------
+
+const SCENES = [];
+const CUES = [];
+let T = 0;
+
+const CHAPTERS = {
+  1: '人生如泊松分布',
+  2: '什么是泊松分布',
+  3: '唯一能改的，是那个平均次数',
+  4: '出手本身，就在提高质量',
+};
+
+function scene(dur, chapter, build, fout = 0.6) {
+  const s = { t0: T, dur, chapter, fout };
+  s.draw = build(s);
+  SCENES.push(s);
+  T += dur;
+  return s;
+}
+
+// 配乐提示：chime 叮的一声 / tick 轻点 / swell 铺底涌起 / low 低沉一击
+function cue(t, kind, o = {}) { CUES.push(Object.assign({ t, kind }, o)); }
+
+// 章节标题卡（参考「02 标尺立好，就要敢跳。」的版式）
+function card(num, title, sub, graphic) {
+  return s => {
+    cue(s.t0, 'swell', { dur: 2.6, gain: 0.55 });
+    return lt => {
+      caption(lt, 0.2, s.dur, num, { x: 200, y: 462, align: 'left', size: 24, font: 'mono', weight: 500, color: COL.gold, ls: 6, glow: 0.25, fout: 0, rise: 8 });
+      line(200, 490, 200 + 64 * easeOut((lt - 0.4) / 0.8), 490, { color: COL.gold, w: 2, alpha: 0.9 });
+      caption(lt, 0.5, s.dur, title, { x: 200, y: 580, align: 'left', size: 80, weight: 900, glow: 0.42, fout: 0, maxW: 1180 });
+      if (sub) caption(lt, 1.1, s.dur, sub, { x: 200, y: 680, align: 'left', size: 30, font: 'sans', weight: 400, color: COL.grey, glow: 0, fout: 0 });
+      if (graphic) graphic(lt);
+    };
+  };
+}
+
+// ===== 开场：人生如泊松分布 =====
+scene(8.4, 0, s => {
+  const X0 = 260, X1 = 1660, Y = 640;
+  let ev;
+  for (let seed = 11; ; seed++) {
+    ev = poissonTimes(7, 1, rng(seed));
+    if (ev.length >= 7 && ev.length <= 9 && ev[0] > 0.04 && ev[ev.length - 1] < 0.96) break;
+  }
+  const rh = rng(5);
+  ev = ev.map(u => ({ u, h: 40 + rh() * 80 }));
+  const head = lt => easeInOut((lt - 0.9) / 5.0);
+  const notes = [0, 2, 4, 1, 3, 5, 2, 4, 6];
+  ev.forEach((e, i) => {
+    e.at = whenReaches(head, e.u, 0.9, 5.9);
+    cue(s.t0 + e.at, 'chime', { note: notes[i], gain: 0.5 });
+  });
+  return lt => {
+    const d = easeOut((lt - 0.2) / 1.2);
+    line(X0, Y, lerp(X0, X1, d), Y, { color: 'rgba(255,255,255,0.22)' });
+    const hx = lerp(X0, X1, head(lt));
+    if (lt > 0.9) line(X0, Y, hx, Y, { color: COL.gold, w: 2, alpha: 0.75, glow: 10 });
+    for (const e of ev) {
+      if (lt < e.at) continue;
+      const k = lt - e.at, flash = Math.exp(-k * 3);
+      const x = lerp(X0, X1, e.u), h = e.h * easeOut(k / 0.35);
+      line(x, Y, x, Y - h, { color: COL.gold, w: 2, alpha: 0.55 + 0.45 * flash, glow: 8 + 16 * flash });
+      glowDot(x, Y, 3, 0.55 + 0.45 * flash);
+    }
+    if (lt > 0.9) glowDot(hx, Y, 4, vis(lt, 0.9, 6.3, 0.3, 0.5));
+    caption(lt, 2.4, 8.4, '人生如{泊松分布}', { y: 420, size: 108, weight: 900, glow: 0.45, fout: 0 });
+    caption(lt, 3.2, 8.4, 'LIFE  AS  A  POISSON  PROCESS', { y: 760, size: 18, font: 'mono', weight: 400, ls: 6, color: COL.dim, glow: 0, fout: 0, rise: 8 });
+  };
+});
+
+// ===== 01 人生如泊松分布 =====
+scene(27.2, 1, s => {
+  const AX0 = 240, AX1 = 1680, Y = 790;
+  const ax = age => lerp(AX0, AX1, (age - 18) / 22);
+  const M = [
+    [18.6, '考上一所好大学', 190], [22.4, '一份 offer', 250], [27.3, '一次升职', 170],
+    [30.8, '一个看见你的人', 235], [35.9, '一个改变方向的机会', 200],
+  ];
+  const head = lt => 18 + 22 * easeInOut((lt - 1.6) / 6.0);
+  const at = M.map(m => whenReaches(head, m[0], 1.6, 7.6));
+  at.forEach((t, i) => cue(s.t0 + t, 'chime', { note: i + 2, gain: 0.6 }));
+  const gaps = M.map((m, i) => [m[0], i + 1 < M.length ? M[i + 1][0] : 40]);
+  return lt => {
+    const base = MA;
+    MA = base * (1 - 0.68 * smooth((lt - 21.9) / 0.8));
+
+    // 年龄轴 18 → 40 岁
+    const d = easeOut((lt - 0.3) / 1.2);
+    const drawn = lerp(AX0, AX1, d);
+    line(AX0, Y, drawn, Y, { color: 'rgba(255,255,255,0.24)' });
+    for (let age = 18; age <= 40; age++) {
+      const x = ax(age);
+      if (x > drawn + 0.5) break;
+      const major = age === 18 || age % 5 === 0;
+      line(x, Y, x, Y + (major ? 10 : 5), { color: COL.axis, w: 1.2 });
+      if (major) label(age === 40 ? '40 岁' : String(age), x, Y + 34, { size: 17, ls: 4 });
+    }
+
+    // 平地期：好消息之间的空白
+    const ga = smooth((lt - 12.3) / 1.0);
+    gaps.forEach(([a, b], i) => {
+      rect(ax(a) + 10, Y - 150, ax(b) - ax(a) - 20, 148, 'rgb(120,142,196)', 0.07 * ga);
+      const la = smooth((lt - 17.6 - 0.25 * i) / 0.6);
+      sansLabel('平地期', (ax(a) + ax(b)) / 2, Y - 74, { color: COL.gold, alpha: 0.85 * la, ls: 4 });
+    });
+
+    // 已经走过的岁月
+    const age = head(lt);
+    if (lt > 1.6) line(AX0, Y, ax(age), Y, { color: COL.gold, w: 2, alpha: 0.85, glow: 10 });
+
+    // 好消息
+    M.forEach(([a, name, h], i) => {
+      if (lt < at[i]) return;
+      const k = lt - at[i], flash = Math.exp(-k * 3);
+      const x = ax(a), top = Y - h * easeOut(k / 0.4);
+      line(x, Y, x, top, { color: COL.gold, w: 2, alpha: 0.6 + 0.4 * flash, glow: 8 + 16 * flash });
+      glowDot(x, Y, 3.5, 0.6 + 0.4 * flash);
+      glowDot(x, top, 2.5, 0.5 + 0.5 * flash);
+      sansLabel(name, x, top - 30, { size: 24, color: COL.white, alpha: easeOut(k / 0.5), ls: 1 });
+    });
+
+    // 播放头与年龄读数
+    const pa = vis(lt, 1.5, 8.6, 0.4, 0.8);
+    if (pa > 0) {
+      const hx = ax(age);
+      line(hx, Y - 330, hx, Y + 18, { color: COL.gold, w: 1.5, alpha: 0.55 * pa, glow: 8 });
+      glowDot(hx, Y, 5, pa);
+      text(`${age.toFixed(1)}`, hx, Y - 372, { size: 40, font: 'mono', weight: 500, color: COL.gold, glow: 0.35, alpha: pa });
+      label('岁', hx, Y - 340, { size: 15, ls: 4, color: COL.grey, alpha: pa });
+    }
+
+    MA = base;
+    caption(lt, 0.5, 5.6, '人生里的好消息，都很少。');
+    caption(lt, 5.9, 11.6, '你盼着它，却不知道它哪天来、会不会来，');
+    caption(lt, 6.6, 11.6, '也没办法让它明天就来。', { y: 254, size: 30, font: 'sans', weight: 400, color: COL.grey, glow: 0 });
+    caption(lt, 11.9, 16.8, '所以大部分日子，你都活在两个好消息之间。');
+    caption(lt, 17.1, 21.6, '那段什么都没发生的日子，叫{平地期}。');
+    caption(lt, 21.9, 27.2, '数学里有一个专门描述这类事的工具，叫{泊松分布}。', { fout: 0 });
+  };
+});
+
+// ===== 02 卡片 =====
+scene(4.6, 0, card('02', '什么是泊松分布？', null, (() => {
+  const r = rng(17);
+  const rows = [610, 660, 710].map(y => ({ y, ev: poissonTimes(5 + r() * 4, 1, r) }));
+  return lt => {
+    const p = clamp((lt - 0.8) / 2.6);
+    rows.forEach(({ y, ev }) => {
+      line(1440, y, 1800, y, { color: 'rgba(255,255,255,0.16)', w: 1 });
+      ev.forEach(u => {
+        if (u > p) return;
+        const x = lerp(1440, 1800, u), f = Math.exp(-(p - u) * 6);
+        line(x, y - 12, x, y + 12, { color: f > 0.5 ? COL.gold : COL.ink, w: 2, alpha: 0.5 + 0.5 * f, glow: 10 * f });
+      });
+    });
+  };
+})()));
+
+// ===== 02 三种随机到来的事 =====
+scene(15.0, 2, s => {
+  const X0 = 600, X1 = 1640, rows = [430, 560, 690];
+  const names = ['路口 · 一年里的事故', '小店 · 一小时进的客人', '手机 · 一天的陌生来电'];
+  const r = rng(21);
+  const ev = [5, 9, 6].map(rate => poissonTimes(rate, 1, r));
+  const head = lt => clamp((lt - 1.0) / 6.0);
+  ev.forEach(row => row.forEach(u => cue(s.t0 + 1.0 + u * 6.0, 'tick', { gain: 0.35 })));
+  const items = ['每一次发生的机会都很小', '每一次之间互不影响', '但从长期看，它发生的平均频率是稳定的'];
+  items.forEach((_, i) => cue(s.t0 + 7.8 + 1.8 * i, 'chime', { note: i + 1, gain: 0.45 }));
+  return lt => {
+    const base = MA;
+    MA = base * (1 - smooth((lt - 6.9) / 0.7));
+    if (MA > 0) {
+      const p = head(lt), hx = lerp(X0, X1, p);
+      rows.forEach((y, i) => {
+        sansLabel(names[i], X0 - 40, y, { align: 'right', size: 24, alpha: smooth((lt - 0.6 - 0.2 * i) / 0.6) });
+        line(X0, y, lerp(X0, X1, easeOut((lt - 0.4) / 1.0)), y, { color: 'rgba(255,255,255,0.18)', w: 1 });
+        for (const u of ev[i]) {
+          if (u > p) continue;
+          const x = lerp(X0, X1, u), f = Math.exp(-(lt - 1.0 - u * 6.0) * 3);
+          line(x, y - 18, x, y + 18, { color: COL.ink, w: 2, alpha: 0.7 });
+          if (f > 0.02) line(x, y - 18, x, y + 18, { color: COL.gold, w: 2.5, alpha: f, glow: 16 });
+        }
+      });
+      if (lt > 1.0 && lt < 7.2) line(hx, rows[0] - 50, hx, rows[2] + 50, { color: COL.gold, w: 1.2, alpha: 0.4, glow: 6 });
+    }
+    MA = base;
+    caption(lt, 0.4, 6.6, '一个路口一年出几次事故，一家店一小时进来几个客人，\n你一天接到几个陌生电话。', { size: 46, y: 190 });
+    caption(lt, 7.0, 15.0, '这类事有三个特点：', { fout: 0 });
+    items.forEach((it, i) => {
+      const t0 = 7.8 + 1.8 * i, y = 440 + 120 * i;
+      caption(lt, t0, 15, `0${i + 1}`, { x: 520, y, align: 'left', size: 24, font: 'mono', weight: 500, color: COL.gold, ls: 4, glow: 0.25, fout: 0, rise: 10 });
+      caption(lt, t0 + 0.1, 15, it, { x: 600, y, align: 'left', size: 46, weight: 700, fout: 0, rise: 10 });
+    });
+  };
+});
+
+// ===== 02 普鲁士骑兵被马踢死 =====
+scene(14.6, 2, s => {
+  const obs = [109, 65, 22, 3, 1];
+  const pred = obs.map((_, k) => 200 * pmf(k, 0.61));
+  const P = { x0: 560, x1: 1420, y0: 860, y1: 390 };
+  const bx = k => P.x0 + 86 + 172 * k, by = v => lerp(P.y0, P.y1, v / 120);
+  obs.forEach((_, k) => {
+    cue(s.t0 + 1.4 + 0.22 * k, 'tick', { gain: 0.5 });
+    cue(s.t0 + 4.2 + 0.36 * k, 'chime', { note: 6 - k, gain: 0.42 });
+  });
+  return lt => {
+    caption(lt, 0.3, 7.4, '一百多年前，有人统计了', { y: 120, size: 28, font: 'sans', weight: 400, color: COL.grey, glow: 0 });
+    caption(lt, 0.5, 7.4, '普鲁士骑兵二十年里，每年被马踢死的人数。', { y: 186, size: 50 });
+    caption(lt, 7.7, 14.6, '这种事看起来纯属意外，', { y: 160, size: 50, fout: 0 });
+    caption(lt, 8.4, 14.6, '可用泊松分布一算，预测和实际几乎{一模一样}。', { y: 232, size: 30, font: 'sans', weight: 400, color: COL.grey, glow: 0, fout: 0 });
+
+    const ca = smooth((lt - 0.8) / 0.8);
+    for (const v of [0, 40, 80, 120]) {
+      line(P.x0, by(v), P.x1, by(v), { color: COL.grid, w: 1, alpha: ca });
+      label(String(v), P.x0 - 18, by(v), { align: 'right', alpha: ca });
+    }
+    line(P.x0, P.y0, P.x1, P.y0, { alpha: ca });
+    sansLabel('↑ 出现的次数（共 200 个军团·年）', P.x0 - 4, P.y1 - 46, { align: 'left', alpha: ca });
+    sansLabel('一个军团一年里被马踢死的人数 →', P.x1, P.y0 + 72, { align: 'right', alpha: ca });
+
+    obs.forEach((v, k) => {
+      label(`${k}`, bx(k), P.y0 + 30, { size: 18, color: COL.grey, alpha: ca });
+      const g = easeOut((lt - 1.4 - 0.22 * k) / 0.9);
+      if (g <= 0) return;
+      const top = lerp(P.y0, by(v), g);
+      rect(bx(k) - 24, top, 48, P.y0 - top, 'rgb(222,227,236)', 0.78);
+      label(String(v), bx(k), top - 20, { size: 18, color: COL.white, alpha: smooth((lt - 2.2 - 0.22 * k) / 0.4) });
+    });
+
+    // 泊松预测：金色折线逐点连起来
+    const pts = pred.map((v, k) => [bx(k), by(v)]);
+    const pu = clamp((lt - 4.2) / 1.44) * 4;
+    if (pu > 0) {
+      const path = pts.slice(0, Math.floor(pu) + 1);
+      const i = Math.floor(pu);
+      if (i < 4) path.push([lerp(pts[i][0], pts[i + 1][0], pu - i), lerp(pts[i][1], pts[i + 1][1], pu - i)]);
+      goldPath(path, 0.9, 2.5);
+    }
+    pts.forEach(([x, y], k) => {
+      const a = smooth((lt - 4.2 - 0.36 * k) / 0.3);
+      if (a <= 0) return;
+      glowDot(x, y, 4, a);
+      label(pred[k].toFixed(1), x + 36, y + (k === 3 ? -14 : 0), { align: 'left', size: 16, color: COL.gold, alpha: a });
+    });
+
+    // 图例 + 计数器
+    const la = smooth((lt - 4.4) / 0.6);
+    const lw = lineWidthOf('泊松预测', Object.assign({}, TEXT_DEFAULTS, { size: 20, font: 'sans', weight: 400, ls: 1 }));
+    sansLabel('泊松预测', P.x1, P.y1 - 46, { align: 'right', color: COL.gold, alpha: la });
+    glowDot(P.x1 - lw - 16, P.y1 - 46, 3.5, la);
+    sansLabel('实际记录', P.x1 - lw - 44, P.y1 - 46, { align: 'right', alpha: ca });
+    rect(P.x1 - lw - 44 - 102, P.y1 - 54, 12, 16, 'rgb(222,227,236)', 0.78 * ca);
+
+    counter('CORPS · YEARS', '200', 1760, 400, ca);
+    label('λ = 0.61', 1760, 506, { align: 'right', size: 22, color: COL.gold, ls: 2, alpha: la });
+  };
+});
+
+// ===== 02 只由一个数决定 =====
+scene(20.0, 2, s => {
+  const LAM = 2;
+  const probs = Array.from({ length: 8 }, (_, k) => pmf(k, LAM));
+  const bx = k => 700 + 136 * k, BY = 800, SC = 1150;
+  cue(s.t0 + 1.0, 'chime', { note: 0, oct: -1, gain: 0.65 });
+  probs.forEach((_, k) => cue(s.t0 + 6.0 + 0.12 * k, 'tick', { gain: 0.4 }));
+  cue(s.t0 + 12.3, 'swell', { dur: 3.0, gain: 0.35 });
+  const ROWS = 7, REFRESH = 0.24, SX0 = 640, SX1 = 1680;
+  return lt => {
+    caption(lt, 0.4, 5.0, '泊松分布只由一个数决定：');
+    caption(lt, 5.2, 11.8, '知道这个数，就能算出下一段时间里它发生 0 次、1 次、2 次的概率。');
+    caption(lt, 12.1, 20.0, '但你永远算不出，它具体会落在哪一天。', { fout: 0 });
+
+    // λ：先居中，再移到左侧
+    const mv = easeInOut((lt - 4.9) / 1.0);
+    const lx = lerp(960, 330, mv), size = lerp(220, 150, mv);
+    caption(lt, 1.0, 20, '{λ}', { x: lx, y: 560, size, font: 'mono', weight: 500, glow: 0.5, fout: 0, rise: 10 });
+    caption(lt, 1.6, 4.9, '一段时间里，这件事平均发生几次', { y: 740, size: 26, font: 'sans', weight: 400, color: COL.grey, glow: 0, fout: 0.4 });
+    text('= 2', lx + 76, 566, { align: 'left', size: 84, font: 'mono', weight: 400, color: COL.white, glow: 0.15, ls: -14, alpha: smooth((lt - 5.6) / 0.6) });
+
+    // 概率分布柱
+    const base = MA;
+    MA = base * smooth((lt - 5.8) / 0.5) * (1 - smooth((lt - 12.1) / 0.6));
+    if (MA > 0) {
+      line(640, BY, 1720, BY, {});
+      probs.forEach((p, k) => {
+        const g = easeOut((lt - 6.0 - 0.12 * k) / 0.8), h = p * SC * g;
+        const hi = k <= 2;
+        rect(bx(k) - 26, BY - h, 52, h, hi ? 'rgb(244,173,61)' : 'rgb(222,227,236)', hi ? 0.9 : 0.6);
+        label(`${k}`, bx(k), BY + 28, { size: 18, color: hi ? COL.gold : COL.grey });
+        label(`${(p * 100).toFixed(1)}%`, bx(k), BY - h - 20, { size: 16, color: COL.white, alpha: smooth((lt - 6.6 - 0.12 * k) / 0.4) });
+      });
+      sansLabel('下一段时间里发生的次数 →', 1720, BY + 72, { align: 'right' });
+    }
+
+    // 同一个 λ，每一段时间都不一样
+    MA = base * smooth((lt - 12.5) / 0.6);
+    if (MA > 0) {
+      for (let i = 0; i < ROWS; i++) {
+        const y = 400 + 66 * i;
+        line(SX0, y, SX1, y, { color: 'rgba(255,255,255,0.12)', w: 1 });
+        const epoch = Math.floor((lt - 12.5 + i * REFRESH / ROWS) / REFRESH);
+        const rr = rng(1000 + epoch * 31 + i * 7919);
+        const n = poissonSample(LAM, rr);
+        for (let j = 0; j < n; j++) glowDot(lerp(SX0, SX1, 0.02 + 0.96 * rr()), y, 3.2, 0.95);
+      }
+      sansLabel('下一段时间 →', SX1, 400 + 66 * (ROWS - 1) + 56, { align: 'right' });
+    }
+    MA = base;
+  };
+});
+
+// ===== 02 马踢人的 λ vs 你的 λ =====
+scene(10.2, 2, s => {
+  [5.6, 6.9, 8.2].forEach((t, i) => cue(s.t0 + t, 'chime', { note: 2 + 2 * i, gain: 0.5 }));
+  return lt => {
+    caption(lt, 0.4, 10.2, '马踢人的平均次数，没有人能改。', { y: 170, fout: 0 });
+    caption(lt, 4.4, 10.2, '但人生里好消息的平均次数，{你能改}。', { y: 250, fout: 0 });
+    line(960, 470, 960, 720, { color: 'rgba(255,255,255,0.1)', w: 1, alpha: smooth((lt - 0.8) / 0.8) });
+    caption(lt, 0.9, 10.2, 'λ = 0.61', { x: 600, y: 580, size: 104, font: 'mono', weight: 400, color: COL.dim, glow: 0, fout: 0 });
+    caption(lt, 1.2, 10.2, '普鲁士骑兵 · 被马踢', { x: 600, y: 690, size: 22, font: 'sans', weight: 400, color: COL.dim, glow: 0, ls: 2, fout: 0 });
+    const v = lerp(0.61, 3.0, easeInOut((lt - 5.2) / 3.6));
+    caption(lt, 4.8, 10.2, `{λ = ${v.toFixed(2)}}`, { x: 1320, y: 580, size: 104, font: 'mono', weight: 500, glow: 0.5, fout: 0 });
+    caption(lt, 5.0, 10.2, '你的人生 · 好消息', { x: 1320, y: 690, size: 22, font: 'sans', weight: 400, color: COL.grey, glow: 0, ls: 2, fout: 0 });
+  };
+});
+
+// ===== 03 卡片 =====
+scene(5.4, 0, card('03', '唯一能改的，是那个平均次数。', '它取决于两件事：你出手的次数，和每次出手的质量。', (() => {
+  const r = rng(23);
+  const pts = Array.from({ length: 40 }, (_, i) => {
+    const u = i / 39;
+    return [lerp(1460, 1800, u), 770 - 200 * Math.pow(u, 1.5) + (r() - 0.5) * 10 * (1 - u)];
+  });
+  return lt => {
+    const p = easeInOut((lt - 0.9) / 2.6), n = Math.max(2, Math.round(p * 39) + 1);
+    line(1460, 790, 1800, 790, { color: 'rgba(255,255,255,0.16)', w: 1 });
+    if (p > 0) {
+      goldPath(pts.slice(0, n), 1, 2.5);
+      glowDot(...pts[n - 1], 4, 1);
+    }
+  };
+})()));
+
+// ===== 03 投十份 vs 投一百份 =====
+scene(14.0, 3, s => {
+  const X0 = 560, X1 = 1640;
+  const rows = [
+    { y: 480, n: 10, name: '投十份', sub: '10 次出手', hits: [] },
+    { y: 700, n: 100, name: '投一百份', sub: '100 次出手', hits: [37, 81] },
+  ];
+  const r = rng(41);
+  rows.forEach(row => { row.u = Array.from({ length: row.n }, () => 0.02 + 0.96 * r()).sort((a, b) => a - b); });
+  const head = lt => clamp((lt - 0.8) / 6.8);
+  rows.forEach(row => row.u.forEach((u, i) => {
+    const t = s.t0 + 0.8 + u * 6.8;
+    if (row.hits.includes(i)) cue(t, 'chime', { note: 3 + 2 * row.hits.indexOf(i), gain: 0.75 });
+    else cue(t, 'tick', { gain: row.n > 50 ? 0.12 : 0.3 });
+  }));
+  return lt => {
+    caption(lt, 0.4, 4.8, '投十份简历和投一百份，');
+    caption(lt, 5.0, 9.2, '面试两次和二十次，');
+    caption(lt, 9.4, 14.0, '只在一家公司熬，和让更多人看见你的能力，', { fout: 0 });
+    const p = head(lt), ca = smooth((lt - 0.2) / 0.8);
+    rows.forEach((row, ri) => {
+      const { y } = row;
+      text(row.name, X0 - 50, y - 12, { align: 'right', size: 32, font: 'sans', weight: 400, color: COL.white, glow: 0.15, alpha: ca });
+      label(row.sub, X0 - 50, y + 24, { align: 'right', alpha: ca });
+      line(X0, y, lerp(X0, X1, easeOut((lt - 0.3) / 0.8)), y, { color: 'rgba(255,255,255,0.18)', w: 1 });
+      for (let m = 0; m <= 12; m++) line(lerp(X0, X1, m / 12), y + 22, lerp(X0, X1, m / 12), y + 28, { color: COL.axis, w: 1, alpha: ca });
+      label('1 月', lerp(X0, X1, 0.5 / 12), y + 48, { size: 14, alpha: ca });
+      label('12 月', lerp(X0, X1, 11.5 / 12), y + 48, { size: 14, alpha: ca });
+      row.u.forEach((u, i) => {
+        if (u > p) return;
+        const x = lerp(X0, X1, u), k = lt - 0.8 - u * 6.8;
+        if (row.hits.includes(i)) {
+          const f = Math.exp(-k * 2.5), top = y - 84 * easeOut(k / 0.4);
+          line(x, y + 14, x, top, { color: COL.gold, w: 2.5, alpha: 0.75 + 0.25 * f, glow: 10 + 18 * f });
+          glowDot(x, top, 3.5, 0.7 + 0.3 * f);
+        } else {
+          line(x, y - 14, x, y + 14, { color: COL.ink, w: 1.6, alpha: 0.6 + 0.3 * Math.exp(-k * 4) });
+        }
+      });
+      const ra = smooth((lt - 7.8 - 0.3 * ri) / 0.6);
+      const got = row.hits.length;
+      text(`好消息 ${got} 次`, X1 + 44, y, { align: 'left', size: 24, font: 'mono', weight: 500, color: got ? COL.gold : COL.grey, glow: got ? 0.35 : 0, alpha: ra });
+    });
+    if (lt > 0.8 && lt < 7.9) line(lerp(X0, X1, p), 400, lerp(X0, X1, p), 770, { color: COL.gold, w: 1.2, alpha: 0.45, glow: 6 });
+    sansLabel('示意：假设每次出手的成功率为 2%', W / 2, 1000, { size: 18, color: COL.dim, alpha: ca });
+  };
+});
+
+// ===== 03 一年里至少等来一次好消息的概率 =====
+scene(14.0, 3, s => {
+  const PR = 0.02, NMAX = 200;
+  const P = { x0: 540, x1: 1500, y0: 860, y1: 360 };
+  const px = n => lerp(P.x0, P.x1, n / NMAX), py = v => lerp(P.y0, P.y1, v);
+  const f = n => 1 - Math.pow(1 - PR, n);
+  // 真实模拟：100 个出手次数 × 100 组 × 每组 100 年 = 1,000,000 个模拟年份
+  const r = rng(51), sims = [];
+  for (let n = 2; n <= NMAX; n += 2) {
+    const q = f(n);
+    for (let b = 0; b < 100; b++) {
+      let hit = 0;
+      for (let y = 0; y < 100; y++) if (r() < q) hit++;
+      sims.push([n, n + (r() - 0.5) * 1.6, hit / 100 + (r() - 0.5) * 0.01]);
+    }
+  }
+  const head = lt => NMAX * easeInOut((lt - 0.8) / 6.8);
+  const ann = [[10, '投十份', COL.grey, 0], [100, '投一百份', COL.gold, 1]];
+  ann.forEach(([n, , , i]) => cue(s.t0 + whenReaches(head, n, 0.8, 7.6), 'chime', { note: i ? 6 : 1, gain: 0.65 }));
+  return lt => {
+    caption(lt, 0.4, 6.6, '这些事不会改变明天有没有好消息，', { y: 170 });
+    caption(lt, 6.8, 14.0, '但会悄悄改变未来一年里，{好消息出现的频率}。', { y: 170, fout: 0 });
+    const ca = smooth((lt - 0.3) / 0.8);
+    axes({
+      ...P,
+      yTicks: [[0, '0%'], [0.25, '25%'], [0.5, '50%'], [0.75, '75%'], [1, '100%']],
+      xTicks: [[0, '0'], [0.25, '50'], [0.5, '100'], [0.75, '150'], [1, '200']],
+      yLabel: '↑ 一年里至少等来一次好消息的概率',
+      xLabel: '一年里出手的次数 →',
+    }, ca);
+    const hn = head(lt);
+    ctx.save();
+    ctx.globalAlpha = 0.34 * MA;
+    ctx.fillStyle = 'rgb(222,228,238)';
+    let shown = 0;
+    for (const [n, jx, v] of sims) {
+      if (n > hn) continue;
+      shown++;
+      ctx.fillRect(px(jx) - 1, py(v) - 1, 2, 2);
+    }
+    ctx.restore();
+    if (hn > 0) {
+      const pts = [];
+      for (let n = 0; n <= hn; n += 1) pts.push([px(n), py(f(n))]);
+      pts.push([px(hn), py(f(hn))]);
+      goldPath(pts, 1, 3);
+      glowDot(px(hn), py(f(hn)), 4.5, vis(lt, 0.8, 8.4, 0.2, 0.6));
+    }
+    ann.forEach(([n, name, color, i]) => {
+      if (hn < n) return;
+      const a = smooth((lt - whenReaches(head, n, 0.8, 7.6)) / 0.4);
+      glowDot(px(n), py(f(n)), 4.5, a, i ? '255,186,84' : '220,228,240');
+      text(`${name} · ${Math.round(f(n) * 100)}%`, px(n) + 22, py(f(n)) + 40, { align: 'left', size: 24, font: 'sans', weight: 400, color, glow: i ? 0.3 : 0, alpha: a });
+    });
+    counter('SIMULATED  YEARS', (shown * 100).toLocaleString('en-US'), 1780, 372, ca);
+    sansLabel('假设每次出手的成功率为 2%', W / 2, 1000, { size: 18, color: COL.dim, alpha: ca });
+  };
+});
+
+// ===== 03 平地期的努力，改的就是这个数 =====
+scene(5.6, 3, s => {
+  cue(s.t0 + 1.0, 'chime', { note: 0, oct: -1, gain: 0.6 });
+  return lt => {
+    caption(lt, 0.4, 5.6, '平地期的努力，改的就是{这个数}。', { y: 520, size: 66, glow: 0.4, fout: 0 });
+    const u = easeOut((lt - 1.0) / 1.2);
+    line(960 - 300 * u, 618, 960 + 300 * u, 618, { color: COL.gold, w: 2, alpha: 0.85, glow: 14 });
+  };
+});
+
+// ===== 04 卡片 =====
+scene(5.0, 0, card('04', '出手本身，就在提高质量。', '很多人不出手，是在等自己准备好。', (() => {
+  const bars = [[1530, 70], [1610, 120], [1690, 178]];
+  return lt => {
+    line(1440, 640, 1800, 640, { color: COL.gold, w: 2, alpha: smooth((lt - 0.6) / 0.6), glow: 10 });
+    line(1440, 760, 1800, 760, { color: 'rgba(255,255,255,0.16)', w: 1 });
+    bars.forEach(([x, h], i) => {
+      const g = easeOut((lt - 1.0 - 0.5 * i) / 0.6);
+      if (g <= 0) return;
+      const over = i === 2;
+      line(x, 760, x, 760 - h * g, { color: over ? 'rgb(255,248,232)' : COL.ink, w: over ? 3 : 2.5, alpha: over ? 1 : 0.35 + 0.2 * i, glow: over ? 14 : 0, glowColor: 'rgba(255,240,210,0.8)' });
+    });
+  };
+})()));
+
+// ===== 04 学习曲线 =====
+scene(28.6, 4, s => {
+  const P = { x0: 540, x1: 1500, y0: 860, y1: 380 };
+  const px = n => lerp(P.x0, P.x1, (n - 1) / 99), py = v => lerp(P.y0, P.y1, v);
+  const q = n => 0.1 + 0.8 * (1 - Math.exp(-(n - 1) / 24));
+  const r = rng(61);
+  const pts = Array.from({ length: 100 }, (_, i) => [i + 1, clamp(q(i + 1) + (r() - 0.5) * 0.12, 0.03, 0.97)]);
+  const head = lt => 1 + 99 * easeInOut((lt - 0.9) / 5.6);
+  const ann = [[1, '第 1 次', COL.grey, 6.6, 'below'], [100, '第 100 次', COL.gold, 6.9, 'above'], [20, '第 20 次', COL.white, 8.0, 'left']];
+  ann.forEach(([, , , t], i) => cue(s.t0 + t, 'chime', { note: [1, 6, 4][i], gain: 0.55 }));
+  cue(s.t0 + 21.6, 'swell', { dur: 2.4, gain: 0.3 });
+  return lt => {
+    caption(lt, 0.4, 5.6, '但质量不是准备出来的，是{出手出来的}。');
+    caption(lt, 5.9, 14.8, '第一次做模拟卷的你和第一百次的你，', { y: 146, size: 48 });
+    caption(lt, 7.4, 14.8, '第一次面试的你和第二十次的你，', { y: 218, size: 48 });
+    caption(lt, 15.0, 20.8, '都不是{同一个人}。');
+    caption(lt, 21.0, 28.6, '前提是，每次出手之后，你都{弄明白了一件事}。', { fout: 0 });
+
+    const ca = smooth((lt - 0.3) / 0.8);
+    axes({
+      ...P,
+      yTicks: [[0.25], [0.5], [0.75], [1]],
+      xTicks: [[0, '1'], [24 / 99, '25'], [49 / 99, '50'], [74 / 99, '75'], [1, '100']],
+      yLabel: '↑ 每次出手的质量',
+      xLabel: '第几次出手 →',
+    }, ca);
+
+    const hn = head(lt);
+    // 「每次都一样」：质量停在第一次的水平
+    const fl = easeInOut((lt - 21.6) / 2.0);
+    if (fl > 0) {
+      strokePath([[px(1), py(q(1))], [lerp(px(1), px(100), fl), py(q(1))]], 'rgb(200,206,216)', 2, 0.75);
+      sansLabel('每次都一样', P.x1 + 18, py(q(1)), { align: 'left', alpha: smooth((lt - 23.2) / 0.5) });
+    }
+    if (hn > 1) {
+      const curve = [];
+      for (let n = 1; n <= hn; n += 0.5) curve.push([px(n), py(q(n))]);
+      goldPath(curve, 0.95, 3);
+    }
+    pts.forEach(([n, v]) => {
+      if (n > hn) return;
+      rect(px(n) - 2, py(v) - 2, 4, 4, 'rgb(228,232,240)', 0.7);
+    });
+    if (hn > 1) glowDot(px(hn), py(q(hn)), 4.5, vis(lt, 0.9, 7.0, 0.2, 0.6));
+    sansLabel('每次都弄明白一件事', P.x1 + 18, py(q(100)) + 2, { align: 'left', color: COL.gold, alpha: smooth((lt - 22.4) / 0.6) });
+
+    ann.forEach(([n, name, color, t, where]) => {
+      const a = smooth((lt - t) / 0.5);
+      if (a <= 0) return;
+      const [, v] = pts[n - 1], x = px(n), y = py(v);
+      glowDot(x, y, 4.5, a, color === COL.gold ? '255,186,84' : '220,228,240');
+      const o = { size: 22, color, glow: color === COL.gold ? 0.3 : 0, alpha: a };
+      if (where === 'below') sansLabel(name, x + 14, y + 34, Object.assign(o, { align: 'left' }));
+      if (where === 'above') sansLabel(name, x, y - 38, o);
+      if (where === 'left') sansLabel(name, x - 20, y - 26, Object.assign(o, { align: 'right' }));
+    });
+  };
+});
+
+// ===== 04 一次出手，重复了一百遍 =====
+scene(11.0, 4, s => {
+  const r = rng(71), N = 100, Y = 620;
+  const xs = Array.from({ length: N }, (_, i) => 460 + i * 10 + (r() - 0.5) * 4);
+  cue(s.t0 + 0.8, 'swell', { dur: 2.2, gain: 0.45 });
+  cue(s.t0 + 7.2, 'low', { gain: 0.8 });
+  cue(s.t0 + 7.2, 'chime', { note: 0, oct: -1, gain: 0.55 });
+  return lt => {
+    caption(lt, 0.4, 5.6, '同一类题错一百次，同一份简历投一百次，');
+    caption(lt, 5.8, 11.0, '都不是一百次出手，而是{一次出手重复了一百遍}。', { fout: 0 });
+    const m = easeInOut((lt - 6.2) / 1.2);
+    xs.forEach((x0, i) => {
+      const a = smooth((lt - 0.8 - i * 0.02) / 0.25);
+      if (a <= 0) return;
+      const x = lerp(x0, 960, m);
+      line(x, Y - 28, x, Y + 28, { color: COL.ink, w: 2, alpha: a * lerp(0.6, 0.06, m) });
+    });
+    const ga = smooth((lt - 7.0) / 0.5);
+    if (ga > 0) {
+      line(960, Y - 44, 960, Y + 44, { color: COL.gold, w: 3, alpha: ga, glow: 20 });
+      glowDot(960, Y, 4, ga);
+    }
+    caption(lt, 2.8, 6.9, '× 100', { x: 1530, y: Y, align: 'left', size: 40, font: 'mono', weight: 400, color: COL.white, glow: 0.15, fout: 0.4, rise: 8 });
+    caption(lt, 7.1, 11.0, '{× 1}', { x: 1530, y: Y, align: 'left', size: 40, font: 'mono', weight: 500, glow: 0.45, fout: 0, rise: 8 });
+  };
+});
+
+// ===== 结尾：你一直在变，世界只是偶尔承认你 =====
+scene(20.0, 0, s => {
+  const X0 = 300, X1 = 1620;
+  const xOf = u => lerp(X0, X1, u);
+  const yOf = u => 860 - 470 * (0.05 + 0.95 * (0.55 * u + 0.45 * u * u) + 0.012 * Math.sin(u * 23));
+  const steps = [0.17, 0.29, 0.52, 0.58, 0.83];
+  const head = lt => easeInOut((lt - 0.6) / 7.4);
+  const head2 = lt => clamp((lt - 8.8) / 6.0);
+  steps.forEach((u, i) => cue(s.t0 + 8.8 + u * 6.0, 'chime', { note: i + 2, gain: 0.75 }));
+  cue(s.t0 + 16.6, 'chime', { note: 0, oct: -1, gain: 0.55 });
+  return lt => {
+    const base = MA;
+    MA = base * (1 - smooth((lt - 15.8) / 1.0));
+    if (MA > 0) {
+      // 你：一条连续上升的线
+      const h = head(lt);
+      if (h > 0) {
+        const pts = [];
+        for (let u = 0; u <= h; u += 0.004) pts.push([xOf(u), yOf(u)]);
+        pts.push([xOf(h), yOf(h)]);
+        goldPath(pts, 1, 3);
+        glowDot(xOf(h), yOf(h), 5, 1);
+        sansLabel('你', xOf(h) + 22, yOf(h) - 24, { size: 24, color: COL.gold, glow: 0.3, alpha: smooth((lt - 1.2) / 0.6) });
+      }
+      // 世界的承认：偶尔跳一下的台阶
+      const h2 = head2(lt);
+      if (lt > 8.8) {
+        const pts = [[xOf(0), yOf(0)]];
+        let level = yOf(0);
+        for (const u of steps) {
+          if (u > h2) break;
+          pts.push([xOf(u), level], [xOf(u), yOf(u)]);
+          level = yOf(u);
+        }
+        pts.push([xOf(h2), level]);
+        strokePath(pts, 'rgb(205,211,222)', 2.2, 0.85);
+        steps.forEach((u, i) => {
+          if (u > h2) return;
+          const k = lt - 8.8 - u * 6.0;
+          glowDot(xOf(u), yOf(u), 3.5, 0.5 + 0.5 * Math.exp(-k * 2.5), '220,228,240');
+        });
+        sansLabel('世界的承认', X0, yOf(0) + 34, { align: 'left', alpha: smooth((lt - 9.2) / 0.8) });
+      }
+      caption(lt, 0.4, 16.8, '只要你还在出手，你就一直在变。', { y: 160, fout: 0 });
+      caption(lt, 8.8, 16.8, '世界只是{偶尔}承认你。', { y: 240, fout: 0 });
+    }
+    MA = base;
+    caption(lt, 16.6, 20.0, '人生如{泊松分布}', { y: 500, size: 88, weight: 900, glow: 0.45, fout: 0 });
+    caption(lt, 17.2, 20.0, 'LIFE  AS  A  POISSON  PROCESS', { y: 600, size: 18, font: 'mono', weight: 400, ls: 6, color: COL.dim, glow: 0, fout: 0, rise: 8 });
+  };
+}, 1.4);
+
+// ---------- 渲染 ----------
+
+SCENES.forEach((s, i) => {
+  s.tagIn = !SCENES[i - 1] || SCENES[i - 1].chapter !== s.chapter;
+  s.tagOut = !SCENES[i + 1] || SCENES[i + 1].chapter !== s.chapter;
+});
+
+function chapterTag(s, lt) {
+  const a = (s.tagIn ? smooth((lt - 0.3) / 0.6) : 1) * (s.tagOut ? vis(lt, 0, s.dur, 0.001, s.fout) : 1);
+  const saved = MA;
+  MA = 1;
+  label(`0${s.chapter}`, 96, 72, { align: 'left', size: 15, font: 'mono', weight: 500, color: COL.gold, ls: 4, alpha: a });
+  label(CHAPTERS[s.chapter], 140, 72, { align: 'left', size: 15, font: 'sans', color: COL.dim, ls: 3, alpha: a });
+  line(96, 92, 120, 92, { color: COL.gold, w: 1.5, alpha: a * 0.8 });
+  MA = saved;
+}
+
+function render(t) {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalAlpha = 1;
+  ctx.shadowBlur = 0;
+  ctx.drawImage(bg, 0, 0);
+  for (const s of SCENES) {
+    const lt = t - s.t0;
+    if (lt < 0 || lt >= s.dur) continue;
+    MA = vis(lt, 0, s.dur, 0.001, s.fout);
+    s.draw(lt);
+    if (s.chapter) chapterTag(s, lt);
+  }
+  MA = 1;
+  const fadeIn = smooth(t / 0.8);
+  if (fadeIn < 1) {
+    ctx.globalAlpha = 1 - fadeIn;
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, W, H);
+    ctx.globalAlpha = 1;
+  }
+}
+
+window.render = render;
+window.DURATION = T;
+window.CUES = CUES.sort((a, b) => a.t - b.t);
+window.SCENE_STARTS = SCENES.map(s => s.t0);
+window.ready = Promise.all([
+  document.fonts.load('900 80px "Noto Serif SC"', '人生'),
+  document.fonts.load('700 50px "Noto Serif SC"', '人生'),
+  document.fonts.load('400 30px "Noto Sans SC"', '人生'),
+  document.fonts.load('400 20px "JetBrains Mono"', 'λ0'),
+  document.fonts.load('500 20px "JetBrains Mono"', 'λ0'),
+]).then(() => true);
+</script>
+</body>
+</html>
