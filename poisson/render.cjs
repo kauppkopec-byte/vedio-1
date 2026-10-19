@@ -2,7 +2,11 @@
 //
 //   node render.cjs info   <build>             导出时长、场景起点与配乐提示 -> <build>/cues.json
 //   node render.cjs stills <build> t1 t2 ...   导出指定时刻的静帧 -> <build>/still_<t>.png
-//   node render.cjs video  <build> [workers]   并行渲染视频分段 -> <build>/seg_*.mp4 + segments.txt
+//   node render.cjs video  <build> [workers]   并行渲染视频分段 -> <build>/chunks-<hash>/*.mp4 + segments.txt
+//
+// 视频按 10 秒一段渲染，已完成的段会被跳过，中断后重跑可以接着渲染；
+// 段目录名带 scene.html 的哈希，画面改动后不会误用旧的分段。
+const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const { spawn, execSync } = require('child_process');
@@ -16,6 +20,7 @@ try {
 
 const FPS = 30;
 const W = 1920, H = 1080;
+const CHUNK = 300;
 const ROOT = __dirname;
 
 async function openScene(browser) {
@@ -42,17 +47,24 @@ function encoder(out) {
   return { ff, done };
 }
 
-async function renderRange(browser, from, to, out, progress) {
+// 一个工作页不断从队列里取段来渲染。用 CDP 直接截图（无损 PNG、快速压缩），
+// 比 page.screenshot 的 PNG 快五倍左右。
+async function worker(browser, queue, total, progress) {
   const page = await openScene(browser);
-  const { ff, done } = encoder(out);
-  for (let i = from; i < to; i++) {
-    await page.evaluate(t => window.render(t), i / FPS);
-    const png = await page.screenshot({ type: 'png' });
-    if (!ff.stdin.write(png)) await new Promise(r => ff.stdin.once('drain', r));
-    progress();
+  const cdp = await page.context().newCDPSession(page);
+  for (let job; (job = queue.shift());) {
+    const part = job.out.replace(/\.mp4$/, '.part.mp4');
+    const { ff, done } = encoder(part);
+    for (let i = job.from; i < Math.min(total, job.from + CHUNK); i++) {
+      await page.evaluate(t => window.render(t), i / FPS);
+      const { data } = await cdp.send('Page.captureScreenshot', { format: 'png', optimizeForSpeed: true });
+      if (!ff.stdin.write(Buffer.from(data, 'base64'))) await new Promise(r => ff.stdin.once('drain', r));
+      progress();
+    }
+    ff.stdin.end();
+    await done;
+    fs.renameSync(part, job.out);
   }
-  ff.stdin.end();
-  await done;
   await page.close();
 }
 
@@ -77,24 +89,24 @@ async function main() {
       const page = await openScene(browser);
       const total = Math.ceil((await page.evaluate(() => window.DURATION)) * FPS);
       await page.close();
-      const per = Math.ceil(total / workers);
+      const hash = crypto.createHash('sha1').update(fs.readFileSync(path.join(ROOT, 'scene.html'))).digest('hex').slice(0, 10);
+      const dir = path.join(build, `chunks-${hash}`);
+      fs.mkdirSync(dir, { recursive: true });
+      const segs = [], queue = [];
+      for (let from = 0; from < total; from += CHUNK) {
+        const out = path.resolve(dir, `${String(from / CHUNK).padStart(3, '0')}.mp4`);
+        segs.push(out);
+        if (!fs.existsSync(out)) queue.push({ from, out });
+      }
+      const todo = queue.reduce((n, j) => n + Math.min(CHUNK, total - j.from), 0);
       let doneFrames = 0, last = 0;
       const progress = () => {
         doneFrames++;
-        const pct = Math.floor(doneFrames / total * 20);
-        if (pct > last) { last = pct; console.log(`frames ${doneFrames}/${total}`); }
+        const pct = Math.floor(doneFrames / todo * 10);
+        if (pct > last) { last = pct; console.log(`frames ${doneFrames}/${todo}`); }
       };
-      const segs = [];
-      const jobs = [];
-      for (let w = 0; w < workers; w++) {
-        const from = w * per, to = Math.min(total, from + per);
-        if (from >= to) break;
-        const out = path.join(build, `seg_${w}.mp4`);
-        segs.push(out);
-        jobs.push(renderRange(browser, from, to, out, progress));
-      }
-      await Promise.all(jobs);
-      fs.writeFileSync(path.join(build, 'segments.txt'), segs.map(s => `file '${path.resolve(s)}'`).join('\n') + '\n');
+      await Promise.all(Array.from({ length: Math.min(workers, queue.length) }, () => worker(browser, queue, total, progress)));
+      fs.writeFileSync(path.join(build, 'segments.txt'), segs.map(s => `file '${s}'`).join('\n') + '\n');
     } else {
       throw new Error(`unknown mode: ${mode}`);
     }
