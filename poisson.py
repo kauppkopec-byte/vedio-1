@@ -186,9 +186,11 @@ def main():
     print("audio done")
 
     node("video", BUILD, str(WORKERS))
+    # 分段是高质量的中间文件；成片再统一编码一次，关键帧间隔拉长到 10 秒，体积约为三分之一
     subprocess.run(["ffmpeg", "-y", "-loglevel", "error",
                     "-f", "concat", "-safe", "0", "-i", os.path.join(BUILD, "segments.txt"),
-                    "-i", wav, "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                    "-i", wav, "-c:v", "libx264", "-preset", "slow", "-crf", "20", "-g", "300",
+                    "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
                     "-shortest", "-movflags", "+faststart", OUT], check=True)
     print("done:", OUT)
 
